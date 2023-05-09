@@ -214,8 +214,8 @@ fn parse_cmd(line: &str) -> CmdResult {
         if cmd_str.is_empty() {
             return Err("Empty command!".into());
         }
-        let mut iter = cmd_str.split(' ').filter(|s| !s.is_empty());
-        let pair = (iter.next().unwrap(), iter.collect::<Vec<&str>>());
+        let cmd_v: Vec<&str> = cmd_str.split(' ').filter(|s| !s.is_empty()).collect();
+        let pair = (cmd_v[0], cmd_v);
         cmd_list.push(pair);
     }
 
@@ -235,13 +235,15 @@ mod test {
 
     #[test]
     fn parse_cmd_test() {
-        let assumed_v = vec![("echo", vec!["hello"]), ("less", vec![])];
-        // eprintln!("{:?}", parse_cmd("echo hello | less").unwrap());
-
-        assert!(vec_compare(
-            parse_cmd("echo hello | less").unwrap(),
-            assumed_v
-        ));
+        let inputs = ["echo abc def", "echo hello | less"];
+        let outputs = [
+            vec![("echo", vec!["echo", "abc", "def"])],
+            vec![("echo", vec!["echo", "hello"]), ("less", vec!["less"])],
+        ];
+        for (input, output) in inputs.iter().zip(outputs) {
+            // eprintln!("{:?}", parse_cmd(input).unwrap());
+            assert!(vec_compare(parse_cmd(input).unwrap(), output));
+        }
     }
 
     //TODO: ijoukei
