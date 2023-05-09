@@ -1,0 +1,248 @@
+use crate::helper::DynError;
+use nix::{
+    libc,
+    sys::{
+        signal::{killpg, signal, SigHandler, Signal},
+        wait::{waitpid, WaitPidFlag, WaitStatus},
+    },
+    unistd::{self, dup2, execvp, fork, pipe, setpgid, tcgetpgrp, tcsetpgrp, ForkResult, Pid},
+};
+use rustyline::{error::ReadlineError, Editor};
+use signal_hook::{consts::*, iterator::Signals};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    ffi::CString,
+    mem::replace,
+    path::PathBuf,
+    process::exit,
+    sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender},
+    thread,
+};
+
+/// wrapper of syscall
+/// if syscall returns EINTR, then retry
+fn syscall<F, T>(f: F) -> Result<T, nix::Error>
+where
+    F: Fn() -> Result<T, nix::Error>,
+{
+    loop {
+        match f() {
+            Err(nix::Error::EINTR) => (),
+            result => return result,
+        }
+    }
+}
+
+/// message that worker thread receive
+enum WorkerMsg {
+    Signal(i32), // receive message
+    Cmd(String), // command input
+}
+
+/// message that main thread receive
+enum ShellMsg {
+    Continue(i32), // restart reading shell, i32 is exit code
+    Quit(i32),     // terminate shell, i32 is exit code of shell
+}
+
+#[derive(Debug)]
+pub struct Shell {
+    logfile: String,
+}
+
+impl Shell {
+    pub fn new(logfile: &str) -> Self {
+        Shell {
+            logfile: logfile.to_string(),
+        }
+    }
+
+    /// main thread
+    pub fn run(&self) -> Result<(), DynError> {
+        // if SITTOU is not set to ignore, SIGTSTP will be delivered.
+        unsafe { signal(Signal::SIGTTOU, SigHandler::SigIgn).unwrap() };
+
+        // at first, generate editor of rustline and load history file
+        let mut rl = Editor::<()>::new()?;
+        if let Err(e) = rl.load_history(&self.logfile) {
+            eprintln!("ZeroSh: fail to read history file: {e}");
+        }
+
+        // generate channel and spawn signal_handler thread and worker thread
+        let (worker_tx, worker_rx) = channel();
+        let (shell_tx, shell_rx) = sync_channel(0);
+        spawn_sig_handler(worker_tx.clone())?;
+        Worker::new().spawn(worker_rx, shell_tx);
+
+        let exit_val;
+        let mut prev_exit_val = 0;
+        loop {
+            // read a line, and send it to worker thread
+            let face = if prev_exit_val == 0 {
+                '\u{1F642}' // 🙂
+            } else {
+                '\u{1F480}' // 💀
+            };
+            match rl.readline(&format!("ZeroSH {face} %> ")) {
+                Ok(line) => {
+                    let line_trimed = line.trim(); // trim space
+                    if line_trimed.is_empty() {
+                        continue; // command is empty
+                    } else {
+                        rl.add_history_entry(line_trimed);
+                    }
+                    worker_tx.send(WorkerMsg::Cmd(line)).unwrap();
+                    match shell_rx.recv().unwrap() {
+                        ShellMsg::Continue(n) => prev_exit_val = n,
+                        ShellMsg::Quit(n) => {
+                            exit_val = n;
+                            break;
+                        }
+                    }
+                }
+                // ctrl + c
+                Err(ReadlineError::Interrupted) => eprintln!("ZeroSh: Ctrl+d to end"),
+                // ctrl + d
+                Err(ReadlineError::Eof) => {
+                    worker_tx.send(WorkerMsg::Cmd("exit".to_string())).unwrap();
+                    match shell_rx.recv().unwrap() {
+                        ShellMsg::Quit(n) => {
+                            exit_val = n;
+                            break;
+                        }
+                        _ => panic!("failed to exit"),
+                    }
+                }
+                Err(e) => {
+                    eprintln!("ZeroSh: failed to read\n{e}");
+                    exit_val = 1;
+                    break;
+                }
+            }
+        }
+
+        if let Err(e) = rl.save_history(&self.logfile) {
+            eprintln!("ZeroSh: failed to write history file : {e}");
+        }
+        exit(exit_val);
+    }
+}
+
+/// signal_handler thread
+fn spawn_sig_handler(tx: Sender<WorkerMsg>) -> Result<(), DynError> {
+    let mut signals = Signals::new(&[SIGINT, SIGTSTP, SIGCHLD])?;
+    thread::spawn(move || {
+        for sig in signals.forever() {
+            tx.send(WorkerMsg::Signal(sig)).unwrap();
+        }
+    });
+
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+enum ProcState {
+    Run,  // in progress
+    Stop, // not in progress
+}
+
+#[derive(Debug, Clone)]
+struct ProcInfo {
+    state: ProcState,
+    pgid: Pid, // process group id
+}
+
+type JobId = usize;
+
+#[derive(Debug)]
+struct Worker {
+    exit_val: i32,   // exit code
+    fg: Option<Pid>, // pid of foreground
+
+    // jobid -> (process group id, command)
+    jobs: BTreeMap<JobId, (Pid, String)>,
+
+    pgid_to_pids: HashMap<Pid, (JobId, HashSet<Pid>)>,
+
+    pid_to_info: HashMap<Pid, ProcInfo>,
+    shell_pgid: Pid, // pid of shell
+}
+
+impl Worker {
+    fn new() -> Self {
+        Worker {
+            exit_val: 0,
+            fg: None, // foreground process is shell
+            jobs: BTreeMap::new(),
+            pgid_to_pids: HashMap::new(),
+            pid_to_info: HashMap::new(),
+
+            // get Pid of shell
+            shell_pgid: tcgetpgrp(libc::STDIN_FILENO).unwrap(),
+        }
+    }
+
+    fn spawn(mut self, worker_rx: Receiver<WorkerMsg>, shell_tx: SyncSender<ShellMsg>) {
+        thread::spawn(move || {
+            for msg in worker_rx.iter() {
+                match msg {
+                    WorkerMsg::Cmd(line) => match parse_cmd(&line) {
+                        Ok(cmd) => {
+                            todo!("kumikomikomando nara worker_rx kara jusin")
+                        }
+                        Err(e) => {
+                            eprintln!("ZeroSh: {}", e);
+                            shell_tx.send(ShellMsg::Continue(self.exit_val)).unwrap();
+                        }
+                    },
+                    WorkerMsg::Signal(SIGCHLD) => {
+                        // self.wait_child(&shell_tx);
+                        unimplemented!()
+                    }
+                    _ => (),
+                }
+            }
+        });
+    }
+}
+
+type CmdResult<'a> = Result<Vec<(&'a str, Vec<&'a str>)>, DynError>;
+
+fn parse_cmd(line: &str) -> CmdResult {
+    let mut cmd_list = vec![];
+    for cmd_str in line.split('|') {
+        if cmd_str.is_empty() {
+            return Err("Empty command!".into());
+        }
+        let mut iter = cmd_str.split(' ').filter(|s| !s.is_empty());
+        let pair = (iter.next().unwrap(), iter.collect::<Vec<&str>>());
+        cmd_list.push(pair);
+    }
+
+    Ok(cmd_list)
+}
+
+#[cfg(test)]
+mod test {
+    use crate::shell::parse_cmd;
+
+    fn vec_compare<T: Eq>(va: Vec<T>, vb: Vec<T>) -> bool {
+        (va.len() == vb.len()) &&  // zip stops at the shortest
+     va.iter()
+       .zip(vb)
+       .all(|(ref a,b)| **a == b)
+    }
+
+    #[test]
+    fn parse_cmd_test() {
+        let assumed_v = vec![("echo", vec!["hello"]), ("less", vec![])];
+        // eprintln!("{:?}", parse_cmd("echo hello | less").unwrap());
+
+        assert!(vec_compare(
+            parse_cmd("echo hello | less").unwrap(),
+            assumed_v
+        ));
+    }
+
+    //TODO: ijoukei
+}
