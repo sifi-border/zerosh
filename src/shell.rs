@@ -204,6 +204,64 @@ impl Worker {
             }
         });
     }
+
+    /// return true if built in command
+    fn built_in_cmd(&mut self, cmd: &[(&str, Vec<&str>)], shell_tx: SyncSender<ShellMsg>) -> bool {
+        if cmd.len() > 1 {
+            return false;
+        }
+        match cmd[0].0 {
+            "exit" => self.run_exit(&cmd[0].1, shell_tx),
+            "jobs" => self.run_jobs(shell_tx),
+            // "fg" => self.run_fg(),
+            // "cd" => self.run_cd(),
+            _ => false,
+        }
+    }
+
+    fn run_exit(&mut self, args: &[&str], shell_tx: SyncSender<ShellMsg>) -> bool {
+        if !self.jobs.is_empty() {
+            eprintln!("can't exit because job is running!");
+            self.exit_val = 1;
+            shell_tx.send(ShellMsg::Continue(self.exit_val)).unwrap();
+            return true;
+        }
+
+        let exit_val = if let Some(s) = args.get(1) {
+            if let Ok(n) = s.parse::<i32>() {
+                n
+            } else {
+                eprintln!("{s} is invalid argment!");
+                self.exit_val = 1;
+                shell_tx.send(ShellMsg::Continue(self.exit_val)).unwrap();
+                return true;
+            }
+        } else {
+            self.exit_val
+        };
+
+        shell_tx.send(ShellMsg::Quit(exit_val)).unwrap();
+        true
+    }
+
+    /// jobID PId State Jobs
+    fn run_jobs(&mut self, shell_tx: SyncSender<ShellMsg>) -> bool {
+        for (job_id, (pgid, cmd)) in &self.jobs {
+            let is_group_stop = self
+                .pgid_to_pids
+                .get(&pgid)
+                .unwrap()
+                .1
+                .iter()
+                .all(|pid| self.pid_to_info.get(pid).unwrap().state == ProcState::Stop);
+            let state_str = if is_group_stop { "Running" } else { "Stopped" };
+            println!("[{job_id}] {state_str}\t{cmd}");
+        }
+        self.exit_val = 0;
+        shell_tx.send(ShellMsg::Continue(self.exit_val)).unwrap();
+
+        true
+    }
 }
 
 type CmdResult<'a> = Result<Vec<(&'a str, Vec<&'a str>)>, DynError>;
