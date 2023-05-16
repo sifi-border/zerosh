@@ -11,6 +11,7 @@ use rustyline::{error::ReadlineError, Editor};
 use signal_hook::{consts::*, iterator::Signals};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
+    env::set_current_dir,
     ffi::CString,
     mem::replace,
     path::PathBuf,
@@ -182,13 +183,18 @@ impl Worker {
         }
     }
 
+    /// activate worker thread
     fn spawn(mut self, worker_rx: Receiver<WorkerMsg>, shell_tx: SyncSender<ShellMsg>) {
         thread::spawn(move || {
             for msg in worker_rx.iter() {
                 match msg {
                     WorkerMsg::Cmd(line) => match parse_cmd(&line) {
                         Ok(cmd) => {
-                            todo!("kumikomikomando nara worker_rx kara jusin")
+                            if self.built_in_cmd(&cmd, &shell_tx) {
+                                continue;
+                            }
+
+                            todo!();
                         }
                         Err(e) => {
                             eprintln!("ZeroSh: {}", e);
@@ -206,20 +212,24 @@ impl Worker {
     }
 
     /// return true if built in command
-    fn built_in_cmd(&mut self, cmd: &[(&str, Vec<&str>)], shell_tx: SyncSender<ShellMsg>) -> bool {
+    fn built_in_cmd(&mut self, cmd: &[(&str, Vec<&str>)], shell_tx: &SyncSender<ShellMsg>) -> bool {
         if cmd.len() > 1 {
             return false;
         }
         match cmd[0].0 {
             "exit" => self.run_exit(&cmd[0].1, shell_tx),
             "jobs" => self.run_jobs(shell_tx),
-            // "fg" => self.run_fg(),
-            // "cd" => self.run_cd(),
+            "fg" => self.run_fg(&cmd[0].1, shell_tx),
+            "cd" => self.run_cd(&cmd[0].1, shell_tx),
             _ => false,
         }
     }
 
-    fn run_exit(&mut self, args: &[&str], shell_tx: SyncSender<ShellMsg>) -> bool {
+    /// run exit command
+    ///
+    /// if first argument is specified, exit the shell with it as the exit code
+    /// if no argument is given, the shell exits with the last exit code of the last exited value
+    fn run_exit(&mut self, args: &[&str], shell_tx: &SyncSender<ShellMsg>) -> bool {
         if !self.jobs.is_empty() {
             eprintln!("can't exit because job is running!");
             self.exit_val = 1;
@@ -245,7 +255,7 @@ impl Worker {
     }
 
     /// jobID PId State Jobs
-    fn run_jobs(&mut self, shell_tx: SyncSender<ShellMsg>) -> bool {
+    fn run_jobs(&mut self, shell_tx: &SyncSender<ShellMsg>) -> bool {
         for (job_id, (pgid, cmd)) in &self.jobs {
             let is_group_stop = self
                 .pgid_to_pids
@@ -260,6 +270,60 @@ impl Worker {
         self.exit_val = 0;
         shell_tx.send(ShellMsg::Continue(self.exit_val)).unwrap();
 
+        true
+    }
+
+    /// brings jobs running in the background to the foreground
+    fn run_fg(&mut self, args: &[&str], shell_tx: &SyncSender<ShellMsg>) -> bool {
+        self.exit_val = 1; // temporary value
+        if args.len() < 2 {
+            eprintln!("usage: fg <number>");
+            shell_tx.send(ShellMsg::Continue(self.exit_val)).unwrap();
+            return true;
+        }
+
+        if let Ok(job_id) = args[1].parse::<usize>() {
+            if let Some((pgid, cmd)) = self.jobs.get(&job_id) {
+                eprintln!("[{job_id}] restart\t{cmd}");
+
+                // set as foreground
+                self.fg = Some(*pgid);
+                tcsetpgrp(libc::STDIN_FILENO, *pgid).unwrap();
+
+                // restart the job
+                killpg(*pgid, Signal::SIGCONT).unwrap();
+                return true;
+            }
+        }
+
+        // fail
+        eprintln!("job id [{}] was not found", args[1]);
+        shell_tx.send(ShellMsg::Continue(self.exit_val)).unwrap();
+
+        true
+    }
+
+    /// change current directiory
+    ///
+    /// if no argument is specified, move to home directiory
+    /// arguments after first arugment are igonored
+    fn run_cd(&mut self, args: &[&str], shell_tx: &SyncSender<ShellMsg>) -> bool {
+        let path = if args.len() == 1 {
+            dirs::home_dir()
+                .or_else(|| Some(PathBuf::from("/")))
+                .unwrap()
+        } else {
+            PathBuf::from(args[1])
+        };
+
+        if let Err(e) = set_current_dir(path) {
+            eprintln!("failed cd command: {e}");
+            self.exit_val = 1;
+        } else {
+            self.exit_val = 0;
+        }
+
+        shell_tx.send(ShellMsg::Continue(self.exit_val)).unwrap();
         true
     }
 }
