@@ -20,6 +20,20 @@ use std::{
     thread,
 };
 
+/// for freeing resources of syscall
+struct CleanUp<F: Fn()> {
+    f: F,
+}
+
+impl<F> Drop for CleanUp<F>
+where
+    F: Fn(),
+{
+    fn drop(&mut self) {
+        (self.f)()
+    }
+}
+
 /// wrapper of syscall
 /// if syscall returns EINTR, then retry
 fn syscall<F, T>(f: F) -> Result<T, nix::Error>
